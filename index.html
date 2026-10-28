@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-  <title>Passper for PDF — Real Client-Side PDF Unlocker</title>
+  <title>Passper for PDF — Multi-File Batch PDF Unlocker</title>
   <!-- Tailwind CSS -->
   <script src="https://cdn.tailwindcss.com"></script>
   <!-- React 18 & ReactDOM 18 -->
@@ -15,6 +15,8 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
   <!-- jsPDF for reconstructing unlocked PDF pages -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  <!-- JSZip for downloading multiple unlocked PDFs as a single ZIP -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 
   <style>
     body {
@@ -32,15 +34,14 @@
   <div id="root"></div>
 
   <script type="text/babel">
-    const { useState, useEffect, useRef } = React;
+    const { useState, useRef } = React;
 
-    // Configure PDF.js worker
     if (window.pdfjsLib) {
       window.pdfjsLib.GlobalWorkerOptions.workerSrc =
         'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
     }
 
-    // Extract smart password candidates from filename (e.g., "18602048_dp_07042019.pdf" -> ["07042019", "18602048", "dp", ...])
+    // Extract smart password candidates from a filename (e.g., "18602048_dp_07042019.pdf" -> ["07042019", "18602048", "dp", ...])
     function extractFilenameCandidates(filename) {
       const base = filename.replace(/\.pdf$/i, '');
       const parts = base.split(/[_-\s.]+/).filter(Boolean);
@@ -50,8 +51,7 @@
         candidates.add(p.toLowerCase());
         candidates.add(p.toUpperCase());
       });
-      // Also extract any 4 to 10 digit sequences inside the filename
-      const numberMatches = base.match(/\d{4,10}/g) || [];
+      const numberMatches = base.match(/\d{4,12}/g) || [];
       numberMatches.forEach(num => candidates.add(num));
       return Array.from(candidates);
     }
@@ -64,33 +64,40 @@
 
     function App() {
       const [activeTab, setActiveTab] = useState('recover'); // 'recover' | 'restrict'
-      const [fileObj, setFileObj] = useState(null); // { name, size, buffer, isEncrypted, pageCount }
-      const [status, setStatus] = useState('idle'); // 'idle' | 'analyzing' | 'ready' | 'attacking' | 'unlocked' | 'exporting' | 'error'
-      const [errorMessage, setErrorMessage] = useState('');
+      // Queue of file items:
+      // { id, name, size, buffer, status: 'analyzing'|'locked'|'attacking'|'unlocked'|'exporting'|'error', pageCount, recoveredPassword, smartCandidates, previewUrl, errorMsg }
+      const [filesQueue, setFilesQueue] = useState([]);
+      const [selectedPreviewFileId, setSelectedPreviewFileId] = useState(null);
 
-      // Password & Attack State
-      const [attackMode, setAttackMode] = useState('dictionary'); // 'dictionary' | 'mask' | 'brute' | 'known'
+      // Global Attack & Password Settings
+      const [attackMode, setAttackMode] = useState('dictionary'); // 'dictionary' | 'known' | 'mask' | 'brute'
       const [knownPasswordInput, setKnownPasswordInput] = useState('');
-      const [maskPattern, setMaskPattern] = useState('0704????'); // e.g., DDMMYYYY where ? is digit
+      const [maskPattern, setMaskPattern] = useState('0704????');
       const [bruteMaxLen, setBruteMaxLen] = useState(4);
       const [customWordlist, setCustomWordlist] = useState([]);
 
-      // Live Progress State
-      const [progress, setProgress] = useState(0);
+      // Batch Progress State
+      const [isBatchRunning, setIsBatchRunning] = useState(false);
+      const [isZipExporting, setIsZipExporting] = useState(false);
+      const [zipProgressText, setZipProgressText] = useState('');
       const [currentAttempt, setCurrentAttempt] = useState('');
       const [attemptsCount, setAttemptsCount] = useState(0);
       const [speed, setSpeed] = useState(0);
-      const [recoveredPassword, setRecoveredPassword] = useState('');
-      const [exportProgress, setExportProgress] = useState({ current: 0, total: 0 });
-      const [previewUrl, setPreviewUrl] = useState('');
+      const [globalNotice, setGlobalNotice] = useState('');
 
       const stopSignalRef = useRef(false);
       const fileInputRef = useRef(null);
 
-      // Test whether a password unlocks the uploaded PDF buffer via PDF.js
+      // Helper to update a specific file item in queue
+      const updateFileById = (id, updater) => {
+        setFilesQueue(prev =>
+          prev.map(item => (item.id === id ? { ...item, ...(typeof updater === 'function' ? updater(item) : updater) } : item))
+        );
+      };
+
+      // Test whether a password unlocks the PDF buffer via PDF.js
       const verifyPdfPassword = async (arrayBuffer, password) => {
         try {
-          // Clone buffer because PDF.js transfers/detaches ArrayBuffers to worker
           const bufferCopy = arrayBuffer.slice(0);
           const loadingTask = window.pdfjsLib.getDocument({
             data: bufferCopy,
@@ -108,8 +115,8 @@
         }
       };
 
-      // Render Page 1 preview thumbnail once unlocked
-      const renderFirstPagePreview = async (arrayBuffer, password) => {
+      // Render Page 1 preview thumbnail
+      const generateFirstPagePreview = async (arrayBuffer, password) => {
         try {
           const bufferCopy = arrayBuffer.slice(0);
           const loadingTask = window.pdfjsLib.getDocument({
@@ -118,233 +125,312 @@
           });
           const pdfDoc = await loadingTask.promise;
           const page = await pdfDoc.getPage(1);
-          const viewport = page.getViewport({ scale: 1.2 });
+          const viewport = page.getViewport({ scale: 1.1 });
           const canvas = document.createElement('canvas');
           canvas.width = viewport.width;
           canvas.height = viewport.height;
           const ctx = canvas.getContext('2d');
+          ctx.fillStyle = '#ffffff';
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
           await page.render({ canvasContext: ctx, viewport }).promise;
-          setPreviewUrl(canvas.toDataURL('image/jpeg', 0.85));
+          const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
           await pdfDoc.destroy();
+          return dataUrl;
         } catch (e) {
-          console.warn('Preview render warning:', e);
+          return '';
         }
       };
 
-      // Handle PDF Upload
-      const handleFileSelect = async (e) => {
-        const file = e.target.files?.[0];
-        if (!file) return;
-        await loadPdfFile(file);
+      // Handle Multi-File Selection or Drop
+      const handleFilesSelect = async (e) => {
+        const selectedFiles = Array.from(e.target.files || []);
+        if (selectedFiles.length === 0) return;
+        await addMultiplePdfFiles(selectedFiles);
+        e.target.value = '';
       };
 
-      const loadPdfFile = async (file) => {
-        setStatus('analyzing');
-        setErrorMessage('');
-        setRecoveredPassword('');
-        setPreviewUrl('');
-        setProgress(0);
-        setAttemptsCount(0);
+      const addMultiplePdfFiles = async (fileList) => {
+        setGlobalNotice('');
+        const pdfFiles = fileList.filter(f => f.name.toLowerCase().endsWith('.pdf') || f.type === 'application/pdf');
+        if (pdfFiles.length === 0) {
+          setGlobalNotice('Please select valid .pdf files.');
+          return;
+        }
 
-        try {
-          const buffer = await file.arrayBuffer();
-          // Check if PDF opens without a password
-          const checkOpen = await verifyPdfPassword(buffer, '');
+        // Create initial queue entries
+        const newEntries = pdfFiles.map((file, idx) => ({
+          id: `${Date.now()}_${idx}_${Math.random().toString(36).slice(2, 7)}`,
+          rawFile: file,
+          name: file.name,
+          size: file.size,
+          buffer: null,
+          status: 'analyzing',
+          pageCount: null,
+          recoveredPassword: '',
+          smartCandidates: extractFilenameCandidates(file.name),
+          previewUrl: '',
+          errorMsg: '',
+        }));
 
-          // Auto-fill smart candidate into Known Password input if filename has an 8-digit date/ID
-          const smartCandidates = extractFilenameCandidates(file.name);
-          const eightDigitMatch = file.name.match(/\d{8}/);
-          if (eightDigitMatch) {
-            setKnownPasswordInput(eightDigitMatch[0]);
-            setMaskPattern(eightDigitMatch[0].slice(0, 4) + '????');
-          }
+        setFilesQueue(prev => [...prev, ...newEntries]);
 
-          if (checkOpen.valid) {
-            setFileObj({
-              name: file.name,
-              size: file.size,
-              buffer,
-              isEncrypted: false,
-              pageCount: checkOpen.numPages,
-              smartCandidates,
+        // Auto-populate Known Password input if first file has an 8-digit sequence and input is empty
+        const firstEightDigit = pdfFiles[0]?.name.match(/\d{8}/);
+        if (firstEightDigit && !knownPasswordInput) {
+          setKnownPasswordInput(firstEightDigit[0]);
+          setMaskPattern(firstEightDigit[0].slice(0, 4) + '????');
+        }
+
+        // Analyze each uploaded file asynchronously
+        for (const entry of newEntries) {
+          try {
+            const buffer = await entry.rawFile.arrayBuffer();
+            const checkOpen = await verifyPdfPassword(buffer, '');
+
+            if (checkOpen.valid) {
+              const previewUrl = await generateFirstPagePreview(buffer, '');
+              updateFileById(entry.id, {
+                buffer,
+                status: 'unlocked',
+                pageCount: checkOpen.numPages,
+                recoveredPassword: '',
+                previewUrl,
+              });
+              setSelectedPreviewFileId(prev => prev || entry.id);
+            } else {
+              updateFileById(entry.id, {
+                buffer,
+                status: 'locked',
+              });
+            }
+          } catch (err) {
+            updateFileById(entry.id, {
+              status: 'error',
+              errorMsg: 'Invalid or corrupted PDF file.',
             });
-            setRecoveredPassword('');
-            setStatus('unlocked');
-            await renderFirstPagePreview(buffer, '');
-          } else {
-            setFileObj({
-              name: file.name,
-              size: file.size,
-              buffer,
-              isEncrypted: true,
-              pageCount: null,
-              smartCandidates,
-            });
-            setStatus('ready');
           }
-        } catch (err) {
-          setErrorMessage('Could not read the PDF file. Please ensure it is a valid PDF document.');
-          setStatus('error');
         }
       };
 
-      // Build candidate queue based on chosen mode
-      const buildCandidateList = () => {
-        const smart = fileObj?.smartCandidates || [];
+      // Build candidate list for a specific file
+      const buildCandidateListForFile = (fileItem) => {
+        const smart = fileItem?.smartCandidates || [];
+        const extraKnown = knownPasswordInput.trim() ? [knownPasswordInput.trim()] : [];
 
         if (attackMode === 'known') {
-          return [knownPasswordInput.trim()];
+          // Test user's entered password first, plus the file's own smart filename tokens
+          return Array.from(new Set([...extraKnown, ...smart]));
         }
 
         if (attackMode === 'dictionary') {
-          // Combine filename tokens + common dates + common passwords + custom wordlist
-          const combined = new Set([...smart, ...customWordlist, ...COMMON_PASSWORDS]);
-          // Also add DDMMYYYY dates for 2019 if filename had 2019, or recent years
-          return Array.from(combined);
+          return Array.from(new Set([...extraKnown, ...smart, ...customWordlist, ...COMMON_PASSWORDS]));
         }
 
         if (attackMode === 'mask') {
-          // Replace '?' in maskPattern with digits 0-9 (supports up to 4 '?' for instant browser execution)
           const qCount = (maskPattern.match(/\?/g) || []).length;
-          if (qCount === 0) return [maskPattern];
+          if (qCount === 0) return Array.from(new Set([maskPattern, ...smart]));
           const maxWildcards = Math.min(qCount, 4);
           const total = Math.pow(10, maxWildcards);
-          const list = [...smart];
+          const list = [...extraKnown, ...smart];
           for (let i = 0; i < total; i++) {
             const digits = i.toString().padStart(maxWildcards, '0').split('');
             let dIdx = 0;
             const candidate = maskPattern.replace(/\?/g, () => (dIdx < digits.length ? digits[dIdx++] : '0'));
             list.push(candidate);
           }
-          return list;
+          return Array.from(new Set(list));
         }
 
         if (attackMode === 'brute') {
-          // Numeric PIN brute force up to bruteMaxLen (up to 4 digits = 10,000 combinations)
-          const list = [...smart];
+          const list = [...extraKnown, ...smart];
           const max = Math.pow(10, Math.min(bruteMaxLen, 4));
           for (let i = 0; i < max; i++) {
             list.push(i.toString().padStart(bruteMaxLen, '0'));
           }
-          return list;
+          return Array.from(new Set(list));
         }
 
-        return smart;
+        return Array.from(new Set([...extraKnown, ...smart]));
       };
 
-      // Start Real Password Recovery against PDF.js
-      const startRecovery = async () => {
-        if (!fileObj) return;
+      // Unlock a single file or all locked files in batch
+      const startBatchRecovery = async (targetFileId = null) => {
+        const targets = filesQueue.filter(f =>
+          targetFileId ? f.id === targetFileId : f.status === 'locked'
+        );
+        if (targets.length === 0) return;
+
         stopSignalRef.current = false;
-        setStatus('attacking');
-        setErrorMessage('');
-        setProgress(0);
+        setIsBatchRunning(true);
+        setGlobalNotice('');
         setAttemptsCount(0);
 
-        const candidates = buildCandidateList();
-        const total = candidates.length;
+        let totalTestedGlobal = 0;
         const startTime = performance.now();
+        let unlockedCount = 0;
 
-        for (let i = 0; i < total; i++) {
-          if (stopSignalRef.current) {
-            setStatus('ready');
-            return;
+        for (const fileItem of targets) {
+          if (stopSignalRef.current) break;
+
+          updateFileById(fileItem.id, { status: 'attacking', errorMsg: '' });
+          const candidates = buildCandidateListForFile(fileItem);
+          let matched = false;
+
+          for (let i = 0; i < candidates.length; i++) {
+            if (stopSignalRef.current) {
+              updateFileById(fileItem.id, { status: 'locked' });
+              break;
+            }
+
+            const candidate = candidates[i];
+            totalTestedGlobal++;
+            setCurrentAttempt(`${fileItem.name.slice(0, 18)}… → ${candidate || '(empty)'}`);
+            setAttemptsCount(totalTestedGlobal);
+
+            const elapsedSec = Math.max(0.1, (performance.now() - startTime) / 1000);
+            setSpeed(Math.round(totalTestedGlobal / elapsedSec));
+
+            const res = await verifyPdfPassword(fileItem.buffer, candidate);
+            if (res.valid) {
+              const previewUrl = await generateFirstPagePreview(fileItem.buffer, candidate);
+              updateFileById(fileItem.id, {
+                status: 'unlocked',
+                recoveredPassword: candidate,
+                pageCount: res.numPages,
+                previewUrl,
+                errorMsg: '',
+              });
+              setSelectedPreviewFileId(prev => prev || fileItem.id);
+              matched = true;
+              unlockedCount++;
+              break;
+            }
           }
 
-          const candidate = candidates[i];
-          setCurrentAttempt(candidate || '(empty)');
-          setAttemptsCount(i + 1);
-          setProgress(Math.min(99, Math.round(((i + 1) / total) * 100)));
-
-          const elapsedSec = Math.max(0.1, (performance.now() - startTime) / 1000);
-          setSpeed(Math.round((i + 1) / elapsedSec));
-
-          const res = await verifyPdfPassword(fileObj.buffer, candidate);
-          if (res.valid) {
-            setRecoveredPassword(candidate);
-            setFileObj((prev) => ({ ...prev, pageCount: res.numPages, isEncrypted: false }));
-            setProgress(100);
-            setStatus('unlocked');
-            await renderFirstPagePreview(fileObj.buffer, candidate);
-            return;
+          if (!matched && !stopSignalRef.current) {
+            updateFileById(fileItem.id, {
+              status: 'locked',
+              errorMsg: `No match in ${candidates.length} candidates. Enter exact password or adjust mask.`,
+            });
           }
         }
 
-        // If not found in current batch
-        setStatus('ready');
-        setErrorMessage(
-          `Tested ${total.toLocaleString()} passwords using ${attackMode.toUpperCase()} mode, but none matched. ` +
-          `If you know the password or format (e.g. Date of Birth DDMMYYYY or PAN/Customer ID), enter it in "Known Password / PIN" or adjust the Mask pattern.`
-        );
+        setIsBatchRunning(false);
+        if (!stopSignalRef.current && unlockedCount < targets.length) {
+          setGlobalNotice(
+            `Unlocked ${unlockedCount} of ${targets.length} PDF(s). For remaining locked files, enter their password/PIN in "Known Password / PIN" or adjust the Mask pattern.`
+          );
+        }
       };
 
-      // REAL PAGE-BY-PAGE PDF EXPORT (Renders every page from PDF.js into a new unlocked jsPDF document)
-      const downloadUnlockedPdf = async () => {
-        if (!fileObj) return;
-        setStatus('exporting');
-        setErrorMessage('');
+      // Build clean unlocked PDF ArrayBuffer / jsPDF instance for a given unlocked file
+      const buildUnlockedPdfInstance = async (fileItem, onPageProgress) => {
+        const bufferCopy = fileItem.buffer.slice(0);
+        const loadingTask = window.pdfjsLib.getDocument({
+          data: bufferCopy,
+          password: fileItem.recoveredPassword || undefined,
+        });
+        const pdfDoc = await loadingTask.promise;
+        const numPages = pdfDoc.numPages;
 
-        try {
-          const bufferCopy = fileObj.buffer.slice(0);
-          const loadingTask = window.pdfjsLib.getDocument({
-            data: bufferCopy,
-            password: recoveredPassword || undefined,
-          });
-          const pdfDoc = await loadingTask.promise;
-          const numPages = pdfDoc.numPages;
-          setExportProgress({ current: 0, total: numPages });
+        const { jsPDF } = window.jspdf;
+        let outPdf = null;
 
-          const { jsPDF } = window.jspdf;
-          let outPdf = null;
+        for (let pageNum = 1; pageNum <= numPages; pageNum++) {
+          if (onPageProgress) onPageProgress(pageNum, numPages);
+          const page = await pdfDoc.getPage(pageNum);
 
-          for (let pageNum = 1; pageNum <= numPages; pageNum++) {
-            setExportProgress({ current: pageNum, total: numPages });
-            const page = await pdfDoc.getPage(pageNum);
+          const scale = 2.2;
+          const viewport = page.getViewport({ scale });
+          const origViewport = page.getViewport({ scale: 1.0 });
 
-            // Render at 2.2x scale for crisp text & graphics
-            const scale = 2.2;
-            const viewport = page.getViewport({ scale });
-            const origViewport = page.getViewport({ scale: 1.0 });
+          const canvas = document.createElement('canvas');
+          canvas.width = viewport.width;
+          canvas.height = viewport.height;
+          const ctx = canvas.getContext('2d');
 
-            const canvas = document.createElement('canvas');
-            canvas.width = viewport.width;
-            canvas.height = viewport.height;
-            const ctx = canvas.getContext('2d');
+          ctx.fillStyle = '#ffffff';
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-            // Fill white background
-            ctx.fillStyle = '#ffffff';
-            ctx.fillRect(0, 0, canvas.width, canvas.height);
+          await page.render({ canvasContext: ctx, viewport }).promise;
+          const imgData = canvas.toDataURL('image/jpeg', 0.92);
 
-            await page.render({ canvasContext: ctx, viewport }).promise;
-            const imgData = canvas.toDataURL('image/jpeg', 0.92);
+          const orientation = origViewport.width > origViewport.height ? 'l' : 'p';
+          const ptWidth = origViewport.width;
+          const ptHeight = origViewport.height;
 
-            const orientation = origViewport.width > origViewport.height ? 'l' : 'p';
-            const ptWidth = origViewport.width;
-            const ptHeight = origViewport.height;
-
-            if (pageNum === 1) {
-              outPdf = new jsPDF({
-                orientation,
-                unit: 'pt',
-                format: [ptWidth, ptHeight],
-                compress: true,
-              });
-            } else {
-              outPdf.addPage([ptWidth, ptHeight], orientation);
-            }
-
-            outPdf.addImage(imgData, 'JPEG', 0, 0, ptWidth, ptHeight, undefined, 'FAST');
+          if (pageNum === 1) {
+            outPdf = new jsPDF({
+              orientation,
+              unit: 'pt',
+              format: [ptWidth, ptHeight],
+              compress: true,
+            });
+          } else {
+            outPdf.addPage([ptWidth, ptHeight], orientation);
           }
 
-          await pdfDoc.destroy();
+          outPdf.addImage(imgData, 'JPEG', 0, 0, ptWidth, ptHeight, undefined, 'FAST');
+        }
 
-          const cleanName = fileObj.name.replace(/\.pdf$/i, '') + '_Unlocked.pdf';
+        await pdfDoc.destroy();
+        return outPdf;
+      };
+
+      // Download single unlocked PDF
+      const downloadSingleUnlockedPdf = async (fileItem) => {
+        updateFileById(fileItem.id, { status: 'exporting' });
+        try {
+          const outPdf = await buildUnlockedPdfInstance(fileItem);
+          const cleanName = fileItem.name.replace(/\.pdf$/i, '') + '_Unlocked.pdf';
           outPdf.save(cleanName);
-          setStatus('unlocked');
         } catch (err) {
-          console.error('Export error:', err);
-          setErrorMessage('Failed to reconstruct PDF pages: ' + (err?.message || 'Unknown error'));
-          setStatus('unlocked');
+          updateFileById(fileItem.id, { errorMsg: 'Export failed: ' + (err?.message || 'Error') });
+        } finally {
+          updateFileById(fileItem.id, { status: 'unlocked' });
+        }
+      };
+
+      // Download ALL unlocked PDFs bundled in a single .ZIP archive (or individually if only 1)
+      const downloadAllUnlockedPdfs = async () => {
+        const unlockedFiles = filesQueue.filter(f => f.status === 'unlocked');
+        if (unlockedFiles.length === 0) return;
+
+        if (unlockedFiles.length === 1) {
+          await downloadSingleUnlockedPdf(unlockedFiles[0]);
+          return;
+        }
+
+        setIsZipExporting(true);
+        try {
+          const zip = new window.JSZip();
+
+          for (let i = 0; i < unlockedFiles.length; i++) {
+            const fileItem = unlockedFiles[i];
+            setZipProgressText(`Rendering ${i + 1}/${unlockedFiles.length}: ${fileItem.name}...`);
+            const outPdf = await buildUnlockedPdfInstance(fileItem, (pg, total) => {
+              setZipProgressText(`File ${i + 1}/${unlockedFiles.length} (Page ${pg}/${total})...`);
+            });
+            const cleanName = fileItem.name.replace(/\.pdf$/i, '') + '_Unlocked.pdf';
+            const pdfBlob = outPdf.output('blob');
+            zip.file(cleanName, pdfBlob);
+          }
+
+          setZipProgressText('Compressing ZIP archive...');
+          const zipBlob = await zip.generateAsync({ type: 'blob' });
+          const url = URL.createObjectURL(zipBlob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `Passper_Unlocked_PDFs_${unlockedFiles.length}_Files.zip`;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+        } catch (err) {
+          setGlobalNotice('ZIP Export failed: ' + (err?.message || 'Unknown error'));
+        } finally {
+          setIsZipExporting(false);
+          setZipProgressText('');
         }
       };
 
@@ -362,12 +448,25 @@
         return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
       };
 
+      const lockedCount = filesQueue.filter(f => f.status === 'locked' || f.status === 'attacking').length;
+      const unlockedCount = filesQueue.filter(f => f.status === 'unlocked' || f.status === 'exporting').length;
+      const previewFile = filesQueue.find(f => f.id === selectedPreviewFileId) || filesQueue.find(f => f.previewUrl);
+
       return (
         <div class="min-h-screen flex flex-col md:flex-row bg-[#0b0f19] text-slate-100">
+          {/* Hidden Multi-File Input shared across buttons */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            accept="application/pdf,.pdf"
+            onChange={handleFilesSelect}
+            class="hidden"
+          />
+
           {/* Sidebar (MacBook Air) / Top Header (Mobile) */}
           <aside class="w-full md:w-64 bg-slate-900/90 border-b md:border-b-0 md:border-r border-slate-800 p-4 flex flex-col justify-between shrink-0">
             <div>
-              {/* macOS Window Traffic Lights + Brand */}
               <div class="flex items-center justify-between md:justify-start gap-3 mb-6">
                 <div class="hidden md:flex items-center gap-1.5">
                   <span class="w-3 h-3 rounded-full bg-rose-500 inline-block"></span>
@@ -380,12 +479,11 @@
                   </div>
                   <div>
                     <h1 class="font-bold text-sm tracking-tight text-white leading-none">Passper for PDF</h1>
-                    <span class="text-[11px] text-emerald-400 font-medium">Real Page Engine v2.4</span>
+                    <span class="text-[11px] text-emerald-400 font-semibold">Batch Engine v3.0</span>
                   </div>
                 </div>
               </div>
 
-              {/* Navigation Tabs */}
               <nav class="grid grid-cols-2 md:grid-cols-1 gap-2">
                 <button
                   onClick={() => setActiveTab('recover')}
@@ -396,7 +494,7 @@
                   }`}
                 >
                   <span>🔐</span>
-                  <span>Recover Passwords</span>
+                  <span>Batch Unlock PDFs</span>
                 </button>
                 <button
                   onClick={() => setActiveTab('restrict')}
@@ -412,152 +510,261 @@
               </nav>
             </div>
 
-            {/* Security Notice */}
             <div class="hidden md:block mt-6 p-3.5 rounded-xl bg-slate-950/80 border border-slate-800/80 text-xs text-slate-400 space-y-1.5">
               <div class="text-slate-200 font-semibold flex items-center gap-1.5">
                 <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
-                100% Local Processing
+                Multi-PDF Local Processing
               </div>
               <p class="leading-relaxed text-[11px]">
-                Your PDF never leaves your MacBook or phone. Every page is decrypted & rendered locally via PDF.js.
+                Select or drop multiple PDFs at once. All decryption and page reconstruction happens 100% locally on your MacBook Air or phone.
               </p>
             </div>
           </aside>
 
           {/* Main Workspace */}
-          <main class="flex-1 p-4 sm:p-6 md:p-8 max-w-4xl mx-auto w-full space-y-6">
-            {/* Header Banner */}
+          <main class="flex-1 p-4 sm:p-6 md:p-8 max-w-5xl mx-auto w-full space-y-6">
+            {/* Top Bar */}
             <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-800 pb-4">
               <div>
                 <h2 class="text-lg sm:text-xl font-bold text-white">
                   {activeTab === 'recover'
-                    ? 'Unlock Password-Protected PDF (Real Page Export)'
-                    : 'Remove PDF Printing, Copying & Editing Restrictions'}
+                    ? 'Multi-File Batch PDF Password Unlocker'
+                    : 'Batch Remove PDF Printing & Copying Restrictions'}
                 </h2>
                 <p class="text-xs sm:text-sm text-slate-400 mt-0.5">
-                  {activeTab === 'recover'
-                    ? 'Crack or enter the PDF Open Password and save a permanent, unencrypted copy with all original pages preserved.'
-                    : 'Strip owner permissions and save a clean PDF with all original pages intact.'}
+                  Select multiple locked PDFs at once, unlock them in batch, and download individually or as a single ZIP.
                 </p>
               </div>
-              {fileObj && (
-                <button
-                  onClick={() => {
-                    setFileObj(null);
-                    setStatus('idle');
-                    setErrorMessage('');
-                    setPreviewUrl('');
-                  }}
-                  class="self-start sm:self-auto px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-medium text-slate-200 transition"
-                >
-                  Change PDF File
-                </button>
+
+              {filesQueue.length > 0 && (
+                <div class="flex flex-wrap items-center gap-2">
+                  <button
+                    onClick={() => fileInputRef.current?.click()}
+                    class="px-3.5 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs transition shadow"
+                  >
+                    + Add More PDFs
+                  </button>
+                  <button
+                    onClick={() => {
+                      setFilesQueue([]);
+                      setSelectedPreviewFileId(null);
+                      setGlobalNotice('');
+                    }}
+                    class="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-medium text-slate-300 transition"
+                  >
+                    Clear All ({filesQueue.length})
+                  </button>
+                </div>
               )}
             </div>
 
-            {/* Error Alert */}
-            {errorMessage && (
-              <div class="p-4 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs sm:text-sm flex items-start justify-between gap-3">
-                <div>
-                  <strong class="font-semibold block text-rose-200 mb-0.5">Notice</strong>
-                  {errorMessage}
-                </div>
-                <button onClick={() => setErrorMessage('')} class="text-rose-400 hover:text-white font-bold">✕</button>
+            {/* Global Notice */}
+            {globalNotice && (
+              <div class="p-4 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-200 text-xs sm:text-sm flex items-start justify-between gap-3">
+                <div>{globalNotice}</div>
+                <button onClick={() => setGlobalNotice('')} class="text-amber-400 hover:text-white font-bold">✕</button>
               </div>
             )}
 
-            {/* Step 1: Dropzone when no file is selected */}
-            {!fileObj && (
+            {/* Empty State Multi-File Dropzone */}
+            {filesQueue.length === 0 && (
               <div
                 onClick={() => fileInputRef.current?.click()}
                 onDragOver={(e) => e.preventDefault()}
                 onDrop={(e) => {
                   e.preventDefault();
-                  const f = e.dataTransfer.files?.[0];
-                  if (f) loadPdfFile(f);
+                  const dropped = Array.from(e.dataTransfer.files || []);
+                  if (dropped.length > 0) addMultiplePdfFiles(dropped);
                 }}
                 class="cursor-pointer border-2 border-dashed border-slate-700 hover:border-amber-500/60 bg-slate-900/50 hover:bg-slate-900/80 transition rounded-2xl p-8 sm:p-12 text-center space-y-4"
               >
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept="application/pdf,.pdf"
-                  onChange={handleFileSelect}
-                  class="hidden"
-                />
                 <div class="w-16 h-16 rounded-2xl bg-amber-500/10 border border-amber-500/30 flex items-center justify-center mx-auto text-3xl">
-                  📄
+                  📚
                 </div>
                 <div class="space-y-1">
                   <p class="text-base sm:text-lg font-semibold text-white">
-                    Tap or Drop Locked PDF File Here
+                    Tap or Drop Multiple Locked PDF Files Here
                   </p>
                   <p class="text-xs sm:text-sm text-slate-400">
-                    Supports RC4 & AES-128/256 encrypted PDFs (e.g., <code class="text-amber-300">18602048_dp_07042019.pdf</code>)
+                    Select 1 or 50+ PDFs at once — works on MacBook Air (⌘-Click / Shift-Click) and Mobile
                   </p>
                 </div>
-                <button class="px-5 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-semibold text-xs sm:text-sm shadow-lg shadow-amber-500/20 transition">
-                  Select PDF from Device
+                <button class="px-6 py-3 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs sm:text-sm shadow-lg shadow-amber-500/20 transition">
+                  Select Multiple PDF Files
                 </button>
               </div>
             )}
 
-            {/* Step 2: File Loaded Workspace */}
-            {fileObj && (
+            {/* Active Batch Queue & Controls */}
+            {filesQueue.length > 0 && (
               <div class="space-y-6">
-                {/* File Summary Card */}
-                <div class="p-4 sm:p-5 rounded-2xl bg-slate-900 border border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                  <div class="flex items-start sm:items-center gap-3.5">
-                    <div class="w-12 h-12 rounded-xl bg-amber-500/15 border border-amber-500/30 flex items-center justify-center text-2xl shrink-0">
-                      {status === 'unlocked' ? '🔓' : '🔒'}
+                {/* Queue Header & Bulk Download Bar */}
+                <div
+                  onDragOver={(e) => e.preventDefault()}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    const dropped = Array.from(e.dataTransfer.files || []);
+                    if (dropped.length > 0) addMultiplePdfFiles(dropped);
+                  }}
+                  class="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden"
+                >
+                  <div class="p-4 bg-slate-950/60 border-b border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                    <div class="flex items-center gap-3 text-xs sm:text-sm">
+                      <span class="font-bold text-white">
+                        PDF Batch Queue ({filesQueue.length} {filesQueue.length === 1 ? 'File' : 'Files'})
+                      </span>
+                      <span class="px-2.5 py-0.5 rounded-full bg-amber-500/15 text-amber-300 text-xs font-medium">
+                        {lockedCount} Locked
+                      </span>
+                      <span class="px-2.5 py-0.5 rounded-full bg-emerald-500/15 text-emerald-300 text-xs font-medium">
+                        {unlockedCount} Unlocked
+                      </span>
                     </div>
-                    <div>
-                      <h3 class="font-bold text-white text-sm sm:text-base break-all">{fileObj.name}</h3>
-                      <div class="flex flex-wrap items-center gap-2 mt-1 text-xs text-slate-400">
-                        <span>Size: <strong class="text-slate-200">{formatSize(fileObj.size)}</strong></span>
-                        <span>•</span>
-                        <span>
-                          Status:{' '}
-                          {status === 'unlocked' ? (
-                            <strong class="text-emerald-400">Unlocked ({fileObj.pageCount} {fileObj.pageCount === 1 ? 'Page' : 'Pages'} Verified)</strong>
-                          ) : (
-                            <strong class="text-amber-400">Open Password Required</strong>
-                          )}
-                        </span>
-                      </div>
-                    </div>
+
+                    {unlockedCount > 0 && (
+                      <button
+                        disabled={isZipExporting}
+                        onClick={downloadAllUnlockedPdfs}
+                        class="px-4 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-bold text-xs sm:text-sm shadow-lg shadow-emerald-500/20 transition"
+                      >
+                        {isZipExporting
+                          ? zipProgressText || 'Building Export...'
+                          : unlockedCount === 1
+                          ? '⬇ Download Unlocked PDF'
+                          : `⬇ Download All ${unlockedCount} Unlocked PDFs (.ZIP)`}
+                      </button>
+                    )}
                   </div>
 
-                  {/* Smart Filename Hint Pill */}
-                  {fileObj.smartCandidates?.length > 0 && status !== 'unlocked' && (
-                    <div class="text-xs bg-slate-950 px-3 py-2 rounded-xl border border-slate-800">
-                      <span class="text-slate-400 block">Smart Filename Tokens Detected:</span>
-                      <div class="flex flex-wrap gap-1.5 mt-1">
-                        {fileObj.smartCandidates.slice(0, 4).map((tok) => (
+                  {/* File List */}
+                  <div class="divide-y divide-slate-800/80 max-h-96 overflow-y-auto">
+                    {filesQueue.map((item) => (
+                      <div
+                        key={item.id}
+                        class="p-3.5 sm:p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 hover:bg-slate-800/30 transition"
+                      >
+                        <div class="flex items-start gap-3 min-w-0">
+                          <div class="w-10 h-10 rounded-xl bg-slate-800 border border-slate-700 flex items-center justify-center text-lg shrink-0">
+                            {item.status === 'unlocked' || item.status === 'exporting'
+                              ? '🔓'
+                              : item.status === 'attacking'
+                              ? '⏳'
+                              : '🔒'}
+                          </div>
+                          <div class="min-w-0 flex-1">
+                            <div class="flex items-center gap-2 flex-wrap">
+                              <p class="font-semibold text-white text-xs sm:text-sm truncate max-w-xs sm:max-w-md">
+                                {item.name}
+                              </p>
+                              <span class="text-[11px] text-slate-400">({formatSize(item.size)})</span>
+                            </div>
+
+                            {/* Status & Smart Tokens */}
+                            <div class="mt-1 flex flex-wrap items-center gap-2 text-xs">
+                              {item.status === 'analyzing' && (
+                                <span class="text-slate-400">Inspecting PDF security...</span>
+                              )}
+                              {item.status === 'locked' && (
+                                <span class="text-amber-400 font-medium">Password Locked</span>
+                              )}
+                              {item.status === 'attacking' && (
+                                <span class="text-amber-300 font-mono animate-pulse">Testing passwords...</span>
+                              )}
+                              {(item.status === 'unlocked' || item.status === 'exporting') && (
+                                <span class="text-emerald-400 font-medium">
+                                  ✓ Unlocked ({item.pageCount} {item.pageCount === 1 ? 'Page' : 'Pages'})
+                                  {item.recoveredPassword && (
+                                    <span class="ml-1.5 px-1.5 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/30 font-mono text-[11px] text-emerald-300">
+                                      PW: {item.recoveredPassword}
+                                    </span>
+                                  )}
+                                </span>
+                              )}
+                              {item.errorMsg && (
+                                <span class="text-rose-400 text-[11px]">{item.errorMsg}</span>
+                              )}
+                            </div>
+
+                            {/* Quick Smart Filename Tokens for Locked File */}
+                            {item.status === 'locked' && item.smartCandidates?.length > 0 && (
+                              <div class="flex flex-wrap items-center gap-1.5 mt-1.5">
+                                <span class="text-[10px] text-slate-500">Detected tokens:</span>
+                                {item.smartCandidates.slice(0, 4).map((tok) => (
+                                  <button
+                                    key={tok}
+                                    onClick={() => {
+                                      setAttackMode('known');
+                                      setKnownPasswordInput(tok);
+                                    }}
+                                    class="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-amber-500/20 text-amber-300 border border-slate-700 font-mono text-[10px]"
+                                  >
+                                    {tok}
+                                  </button>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+
+                        {/* Right-side Per-File Actions */}
+                        <div class="flex items-center gap-2 self-end sm:self-center shrink-0">
+                          {item.previewUrl && (
+                            <button
+                              onClick={() => setSelectedPreviewFileId(item.id)}
+                              class={`px-2.5 py-1.5 rounded-lg text-xs font-medium border transition ${
+                                selectedPreviewFileId === item.id
+                                  ? 'bg-amber-500/20 border-amber-500/50 text-amber-300'
+                                  : 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700'
+                              }`}
+                            >
+                              Preview
+                            </button>
+                          )}
+
+                          {item.status === 'locked' && !isBatchRunning && (
+                            <button
+                              onClick={() => startBatchRecovery(item.id)}
+                              class="px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/30 text-xs font-semibold transition"
+                            >
+                              Unlock
+                            </button>
+                          )}
+
+                          {(item.status === 'unlocked' || item.status === 'exporting') && (
+                            <button
+                              disabled={item.status === 'exporting'}
+                              onClick={() => downloadSingleUnlockedPdf(item)}
+                              class="px-3 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 text-xs font-bold transition"
+                            >
+                              {item.status === 'exporting' ? 'Saving...' : '⬇ Save PDF'}
+                            </button>
+                          )}
+
                           <button
-                            key={tok}
-                            onClick={() => {
-                              setAttackMode('known');
-                              setKnownPasswordInput(tok);
-                            }}
-                            class="px-2 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30 hover:bg-amber-500/25 font-mono text-[11px]"
+                            onClick={() => setFilesQueue(prev => prev.filter(f => f.id !== item.id))}
+                            class="p-1.5 rounded-lg text-slate-500 hover:text-rose-400 hover:bg-slate-800 transition text-xs"
+                            title="Remove file"
                           >
-                            {tok}
+                            ✕
                           </button>
-                        ))}
+                        </div>
                       </div>
-                    </div>
-                  )}
+                    ))}
+                  </div>
                 </div>
 
-                {/* Attack Configuration Panel (When File is Locked) */}
-                {(status === 'ready' || status === 'attacking') && (
+                {/* Batch Decryption Configuration Panel (Visible whenever there is at least 1 locked PDF) */}
+                {lockedCount > 0 && (
                   <div class="p-5 rounded-2xl bg-slate-900 border border-slate-800 space-y-5">
-                    <h4 class="text-sm font-bold text-white uppercase tracking-wider">
-                      Select Decryption Method
-                    </h4>
+                    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                      <h4 class="text-sm font-bold text-white uppercase tracking-wider">
+                        Batch Decryption Method ({lockedCount} Locked {lockedCount === 1 ? 'File' : 'Files'})
+                      </h4>
+                      <span class="text-xs text-slate-400">
+                        Automatically tests each file's own filename numbers/dates + selected mode below
+                      </span>
+                    </div>
 
-                    {/* 4 Mode Selector Cards */}
                     <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
                       <button
                         onClick={() => setAttackMode('dictionary')}
@@ -568,11 +775,11 @@
                         }`}
                       >
                         <div class="font-semibold text-sm flex items-center justify-between">
-                          <span>📚 Smart Dictionary Attack</span>
-                          {attackMode === 'dictionary' && <span class="text-amber-400 text-xs">Selected</span>}
+                          <span>📚 Smart Filename + Dictionary</span>
+                          {attackMode === 'dictionary' && <span class="text-amber-400 text-xs">Active</span>}
                         </div>
                         <p class="text-xs text-slate-400 mt-1">
-                          Tests filename numbers/dates (e.g. <code class="text-amber-300">07042019</code>, <code class="text-amber-300">18602048</code>) + common passwords.
+                          Extracts dates/IDs from each PDF's filename + common passwords.
                         </p>
                       </button>
 
@@ -585,11 +792,11 @@
                         }`}
                       >
                         <div class="font-semibold text-sm flex items-center justify-between">
-                          <span>🔑 Known Password / PIN</span>
-                          {attackMode === 'known' && <span class="text-amber-400 text-xs">Selected</span>}
+                          <span>🔑 Known Password / Shared PIN</span>
+                          {attackMode === 'known' && <span class="text-amber-400 text-xs">Active</span>}
                         </div>
                         <p class="text-xs text-slate-400 mt-1">
-                          Know the password (e.g. DOB, PAN, Customer ID)? Enter it to permanently strip the lock.
+                          Enter a known password (e.g. DOB, PAN, Customer ID) to unlock all matching files.
                         </p>
                       </button>
 
@@ -603,10 +810,10 @@
                       >
                         <div class="font-semibold text-sm flex items-center justify-between">
                           <span>🎭 Mask Attack (Partial Known)</span>
-                          {attackMode === 'mask' && <span class="text-amber-400 text-xs">Selected</span>}
+                          {attackMode === 'mask' && <span class="text-amber-400 text-xs">Active</span>}
                         </div>
                         <p class="text-xs text-slate-400 mt-1">
-                          Use <code class="text-amber-300">?</code> for unknown digits (e.g. <code class="text-amber-300">0704????</code> for a 4-digit year).
+                          Use <code class="text-amber-300">?</code> for unknown digits (e.g. <code class="text-amber-300">0704????</code>).
                         </p>
                       </button>
 
@@ -620,25 +827,24 @@
                       >
                         <div class="font-semibold text-sm flex items-center justify-between">
                           <span>⚡ Numeric PIN Brute-Force</span>
-                          {attackMode === 'brute' && <span class="text-amber-400 text-xs">Selected</span>}
+                          {attackMode === 'brute' && <span class="text-amber-400 text-xs">Active</span>}
                         </div>
                         <p class="text-xs text-slate-400 mt-1">
-                          Tests all numeric PIN combinations (0000–9999) directly against the PDF stream.
+                          Tests all 4-digit PIN combinations (0000–9999) across locked PDFs.
                         </p>
                       </button>
                     </div>
 
-                    {/* Mode-Specific Inputs */}
                     {attackMode === 'known' && (
                       <div class="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
                         <label class="block text-xs font-medium text-slate-300">
-                          Enter PDF Password / PIN / Date (Case-Sensitive):
+                          Enter Shared Password / PIN / Date (Case-Sensitive):
                         </label>
                         <input
                           type="text"
                           value={knownPasswordInput}
                           onChange={(e) => setKnownPasswordInput(e.target.value)}
-                          placeholder="e.g. 07042019 or 18602048 or uppercase PAN"
+                          placeholder="e.g. 07042019 or 18602048 or PAN"
                           class="w-full px-3.5 py-2.5 rounded-xl bg-slate-900 border border-slate-700 text-white font-mono text-sm focus:outline-none focus:border-amber-500"
                         />
                       </div>
@@ -653,7 +859,7 @@
                           type="text"
                           value={maskPattern}
                           onChange={(e) => setMaskPattern(e.target.value)}
-                          placeholder="e.g. 0704???? or 1860????"
+                          placeholder="e.g. 0704????"
                           class="w-full px-3.5 py-2.5 rounded-xl bg-slate-900 border border-slate-700 text-white font-mono text-sm focus:outline-none focus:border-amber-500"
                         />
                       </div>
@@ -662,9 +868,9 @@
                     {attackMode === 'dictionary' && (
                       <div class="p-4 rounded-xl bg-slate-950 border border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                         <div class="text-xs text-slate-400">
-                          Includes smart tokens from <strong class="text-slate-200">{fileObj.name}</strong> + common passwords
+                          Automatically checks each PDF's filename tokens + built-in dictionary
                           {customWordlist.length > 0 && (
-                            <span class="text-emerald-400"> + {customWordlist.length} custom words loaded</span>
+                            <span class="text-emerald-400"> + {customWordlist.length} custom words</span>
                           )}
                         </div>
                         <label class="cursor-pointer px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-medium text-slate-200 shrink-0 text-center">
@@ -674,98 +880,53 @@
                       </div>
                     )}
 
-                    {/* Live Progress Indicator During Attack */}
-                    {status === 'attacking' && (
-                      <div class="p-4 rounded-xl bg-slate-950 border border-amber-500/30 space-y-3">
-                        <div class="flex items-center justify-between text-xs">
-                          <span class="text-amber-300 font-mono">
-                            Testing: <strong>{currentAttempt}</strong>
-                          </span>
-                          <span class="text-slate-400 font-mono">
-                            {attemptsCount} tested • {speed} pw/s • {progress}%
-                          </span>
-                        </div>
-                        <div class="w-full h-2.5 bg-slate-800 rounded-full overflow-hidden">
-                          <div
-                            class="h-full bg-gradient-to-r from-amber-500 to-orange-500 transition-all duration-150"
-                            style={{ width: `${progress}%` }}
-                          ></div>
-                        </div>
+                    {isBatchRunning && (
+                      <div class="p-4 rounded-xl bg-slate-950 border border-amber-500/30 flex items-center justify-between text-xs font-mono">
+                        <span class="text-amber-300 truncate">{currentAttempt}</span>
+                        <span class="text-slate-400 shrink-0 ml-3">
+                          {attemptsCount} tested • {speed} pw/s
+                        </span>
                       </div>
                     )}
 
-                    {/* Action Buttons */}
                     <div class="flex items-center gap-3">
-                      {status !== 'attacking' ? (
+                      {!isBatchRunning ? (
                         <button
-                          onClick={startRecovery}
-                          class="w-full py-3 rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-bold text-sm shadow-lg shadow-amber-500/20 transition"
+                          onClick={() => startBatchRecovery(null)}
+                          class="w-full py-3.5 rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-bold text-sm shadow-lg shadow-amber-500/20 transition"
                         >
-                          {attackMode === 'known' ? 'Unlock PDF Now' : 'Start Real Password Recovery'}
+                          🔓 Unlock All {lockedCount} Locked {lockedCount === 1 ? 'PDF' : 'PDFs'} Now
                         </button>
                       ) : (
                         <button
                           onClick={() => { stopSignalRef.current = true; }}
-                          class="w-full py-3 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-bold text-sm transition"
+                          class="w-full py-3.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-bold text-sm transition"
                         >
-                          Stop Recovery
+                          Stop Batch Recovery
                         </button>
                       )}
                     </div>
                   </div>
                 )}
 
-                {/* Step 3: Unlocked & Real Page Export Panel */}
-                {(status === 'unlocked' || status === 'exporting') && (
-                  <div class="p-5 sm:p-6 rounded-2xl bg-emerald-950/20 border border-emerald-500/30 space-y-5">
-                    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                      <div class="space-y-1">
-                        <span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-500/20 text-emerald-300 text-xs font-semibold">
-                          ✓ PDF Successfully Decrypted
-                        </span>
-                        <h3 class="text-lg font-bold text-white pt-1">
-                          Ready to Save Clean PDF ({fileObj.pageCount} {fileObj.pageCount === 1 ? 'Page' : 'Pages'})
-                        </h3>
-                        <p class="text-xs text-slate-300">
-                          {recoveredPassword ? (
-                            <>
-                              Matched Password:{' '}
-                              <code class="px-2 py-0.5 rounded bg-slate-900 border border-emerald-500/40 text-emerald-300 font-mono font-bold">
-                                {recoveredPassword}
-                              </code>
-                            </>
-                          ) : (
-                            'No open password required — restrictions stripped.'
-                          )}
-                        </p>
-                      </div>
-
-                      <button
-                        disabled={status === 'exporting'}
-                        onClick={downloadUnlockedPdf}
-                        class="px-6 py-3.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-bold text-sm shadow-lg shadow-emerald-500/20 transition shrink-0"
-                      >
-                        {status === 'exporting'
-                          ? `Rendering Page ${exportProgress.current} of ${exportProgress.total}...`
-                          : '⬇ Download Unlocked PDF (All Original Pages)'}
-                      </button>
+                {/* Live Page 1 Preview of Selected Unlocked File */}
+                {previewFile && previewFile.previewUrl && (
+                  <div class="p-5 rounded-2xl bg-slate-900 border border-slate-800 space-y-3">
+                    <div class="flex items-center justify-between">
+                      <span class="text-xs font-semibold text-emerald-400">
+                        ✓ Verified Page 1 Preview — {previewFile.name}
+                      </span>
+                      <span class="text-xs text-slate-400">
+                        {previewFile.pageCount} {previewFile.pageCount === 1 ? 'Page' : 'Pages'} Total
+                      </span>
                     </div>
-
-                    {/* Live First Page Preview so you can verify actual document contents before downloading */}
-                    {previewUrl && (
-                      <div class="pt-3 border-t border-slate-800/80 space-y-2">
-                        <span class="text-xs font-semibold text-slate-400 block">
-                          Verified Page 1 Content Preview:
-                        </span>
-                        <div class="bg-slate-950 p-3 rounded-xl border border-slate-800 max-h-96 overflow-auto flex justify-center">
-                          <img
-                            src={previewUrl}
-                            alt="Unlocked PDF Page 1 Preview"
-                            class="max-w-full h-auto rounded shadow"
-                          />
-                        </div>
-                      </div>
-                    )}
+                    <div class="bg-slate-950 p-3 rounded-xl border border-slate-800 max-h-96 overflow-auto flex justify-center">
+                      <img
+                        src={previewFile.previewUrl}
+                        alt="Unlocked PDF Page 1 Preview"
+                        class="max-w-full h-auto rounded shadow"
+                      />
+                    </div>
                   </div>
                 )}
               </div>
